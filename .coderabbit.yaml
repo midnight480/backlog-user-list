@@ -1,0 +1,12 @@
+# CodeRabbit configuration
+version: 2
+language: "ja"
+reviews:
+  profile: "software_engineer"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+chat:
+  auto_reply: true
