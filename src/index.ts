@@ -778,7 +778,7 @@ const uiTemplate = `
                 } else if (p.teamError) {
                     teamDisplay = '<span style="color:#e74c3c;" title="' + p.teamError + '">⚠ Error</span>';
                 } else {
-                    teamDisplay = '<span class="clickable proj-teams-link" data-pid="' + p.id + '">' + p.teams.length + '</span>';
+                    teamDisplay = '<span class="clickable proj-teams-link" data-pid="' + p.id + '">' + (p.teamCount !== undefined ? p.teamCount : p.teams.length) + '</span>';
                 }
                 tr.innerHTML = \`
                     <td>\${p.projectKey}</td>
@@ -852,7 +852,7 @@ const uiTemplate = `
             proj.teams.forEach(t => {
                 html += \`<tr>
                     <td>\${t.name}</td>
-                    <td><span class="clickable team-users-nested-link" data-tid="\${t.id}">\${t.members.length}</span></td>
+                    <td><span class="clickable team-users-nested-link" data-tid="\${t.id}" data-pid="\${proj.id}">\${t.memberCount}</span></td>
                     <td>\${formatJST(t.updated)}</td>
                 </tr>\`;
             });
@@ -860,35 +860,53 @@ const uiTemplate = `
             openModal('プロジェクト参加チーム', html);
 
             document.querySelectorAll('.team-users-nested-link').forEach(el => {
-                el.addEventListener('click', (e) => {
+                el.addEventListener('click', async (e) => {
                     const tid = parseInt(e.target.dataset.tid);
-                    // Find team from the current project
+                    const pid = parseInt(e.target.dataset.pid);
                     const team = proj.teams.find(x => x.id === tid);
-                    showTeamUsersModal(team);
+                    await showTeamUsersModal(team, pid);
                 });
             });
         }
 
-        function showTeamUsersModal(team) {
-            let html = \`
-                <p><strong>\${team.name}</strong> \${getT('teamUsersTitle', {count: team.members.length})}</p>
-                <table>
-                    <thead><tr><th>名前</th><th>メールアドレス</th><th>権限</th><th>ヌーラボアカウント</th><th>最終ログイン</th></tr></thead>
-                    <tbody>
-            \`;
-            team.members.forEach(u => {
-                html += \`<tr>
-                    <td>\${u.name}</td>
-                    <td>\${u.mailAddress || ''}</td>
-                    <td>\${u.roleName || ''}</td>
-                    <td>\${u.nulabAccountName ? 'あり' : 'なし'}</td>
-                    <td>\${u.lastLoginTimeJST || ''}</td>
-                </tr>\`;
-            });
-            html += \`</tbody></table>
-            <button onclick="document.querySelector('.close').click()" style="margin-top: 15px; background-color: #95a5a6;" data-i18n="closeBtn">閉じる</button>
-            \`;
-            openModal('チームメンバー詳細', html);
+        async function showTeamUsersModal(team, projectId) {
+            const spaceId = document.getElementById('space-id').value;
+            const domain = document.getElementById('domain').value;
+            const apiKey = document.getElementById('api-key').value;
+
+            openModal(team.name, '<p>' + (currentLang === 'ja' ? 'メンバー情報を取得中...' : 'Loading members...') + '</p>');
+
+            try {
+                const res = await fetch('/api/team/members', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ spaceId, domain, apiKey, projectId, teamId: team.id })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Failed to fetch team members');
+
+                let html = \`
+                    <p><strong>\${data.teamName}</strong> \${getT('teamUsersTitle', {count: data.members.length})}</p>
+                    <table>
+                        <thead><tr><th>\${getT('colName')}</th><th>\${getT('colEmail')}</th><th>\${getT('colRole')}</th><th>\${getT('colNulab')}</th><th>\${getT('colLastLogin')}</th></tr></thead>
+                        <tbody>
+                \`;
+                data.members.forEach(u => {
+                    html += \`<tr>
+                        <td>\${u.name}</td>
+                        <td>\${u.mailAddress || ''}</td>
+                        <td>\${u.roleName || ''}</td>
+                        <td>\${u.nulabAccountName ? getT('yes') : getT('no')}</td>
+                        <td>\${u.lastLoginTimeJST || ''}</td>
+                    </tr>\`;
+                });
+                html += \`</tbody></table>
+                <button onclick="document.querySelector('.close').click()" style="margin-top: 15px; background-color: #95a5a6;" data-i18n="closeBtn">\${getT('closeBtn')}</button>
+                \`;
+                document.getElementById('modal-body').innerHTML = html;
+            } catch (err) {
+                document.getElementById('modal-body').innerHTML = '<p style="color:#e74c3c;">' + err.message + '</p>';
+            }
         }
 
         // Pagination, Search, Sorting Logic
@@ -932,7 +950,7 @@ const uiTemplate = `
                 
                 if(key === 'projectCount') { vA = (a.joinedProjects||[]).length; vB = (b.joinedProjects||[]).length; }
                 if(key === 'userCount') { vA = (a.users||[]).length; vB = (b.users||[]).length; }
-                if(key === 'teamCount') { vA = (a.teams||[]).length; vB = (b.teams||[]).length; }
+                if(key === 'teamCount') { vA = a.teamCount !== undefined ? a.teamCount : (a.teams||[]).length; vB = b.teamCount !== undefined ? b.teamCount : (b.teams||[]).length; }
                 if(key === 'hasNulab') { vA = (a.nulabAccountName ? 1 : 0); vB = (b.nulabAccountName ? 1 : 0); }
 
                 if (typeof vA === 'string') vA = vA.toLowerCase();
@@ -1043,15 +1061,24 @@ app.get('/', (c) => {
   return c.html(uiTemplate);
 });
 
-async function fetchAPI(url: string): Promise<any> {
-    const res = await fetch(url);
-    if (res.status === 429) {
-        throw new Error('API Rate Limit Exceeded: Wait and try again.');
+async function fetchAPI(url: string, retries = 3): Promise<any> {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const res = await fetch(url);
+        if (res.status === 429) {
+            if (attempt < retries) {
+                // Wait before retry — use Retry-After header or default to 1s with exponential backoff
+                const retryAfter = res.headers.get('Retry-After');
+                const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 1000 * Math.pow(2, attempt);
+                await new Promise(r => setTimeout(r, waitMs));
+                continue;
+            }
+            throw new Error('API Rate Limit Exceeded: Wait and try again.');
+        }
+        if (!res.ok) {
+            throw new Error(`API Error ${res.status} at ${url}`);
+        }
+        return res.json() as Promise<any>;
     }
-    if (!res.ok) {
-        throw new Error(`API Error ${res.status} at ${url}`);
-    }
-    return res.json() as Promise<any>;
 }
 
 app.post('/api/analyze', async (c) => {
@@ -1129,7 +1156,7 @@ app.post('/api/analyze', async (c) => {
         // 2. For each project, fetch its users & teams
         // GET /api/v2/projects/:id/teams returns members directly, no need for separate team detail calls
         // using concurrency limit to prevent complete rate limiting immediately
-        const CONCURRENT = 3;
+        const CONCURRENT = 2;
         for (let i = 0; i < rawProjects.length; i += CONCURRENT) {
             const batch = rawProjects.slice(i, i + CONCURRENT);
             await Promise.all(batch.map(async (proj: any) => {
@@ -1168,7 +1195,7 @@ app.post('/api/analyze', async (c) => {
                                 id: pt.id,
                                 name: pt.name,
                                 updated: pt.updated,
-                                members: (pt.members || []).map((m: any) => enhanceUser(m))
+                                memberCount: (pt.members || []).length
                             }));
                         }
                     } catch(e: any) {
@@ -1192,6 +1219,7 @@ app.post('/api/analyze', async (c) => {
                     archived: proj.archived,
                     users: outUsers,
                     teams: outTeams,
+                    teamCount: outTeams.length,
                     adminUserIds,
                     teamError
                 });
@@ -1211,6 +1239,53 @@ app.post('/api/analyze', async (c) => {
             licence: licence || null
         });
 
+    } catch (e: any) {
+        return c.json({ error: e.message }, 500);
+    }
+});
+
+// On-demand team members endpoint
+app.post('/api/team/members', async (c) => {
+    try {
+        const { spaceId, domain, apiKey, projectId, teamId } = await c.req.json();
+        if (!spaceId || !domain || !apiKey || !projectId || !teamId) {
+            return c.json({ error: 'Missing parameters' }, 400);
+        }
+
+        const base = `https://${spaceId}.${domain}`;
+
+        const space = await fetchAPI(`${base}/api/v2/space?apiKey=${apiKey}`);
+        const roleMap: Record<number, string> = space.licenseType === 1
+            ? { 1: 'Administrator', 2: 'User', 3: 'Guest' }
+            : { 1: 'Administrator', 2: 'User', 3: 'Reporter', 4: 'Guest' };
+
+        const fmt = (dString: string) => {
+            if (!dString) return '';
+            try {
+                return new Intl.DateTimeFormat('ja-JP', {
+                    timeZone:'Asia/Tokyo', year:'numeric', month:'2-digit', day:'2-digit',
+                    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+                }).format(new Date(dString)).replace(/-/g, '/');
+            } catch { return dString; }
+        };
+
+        // Fetch teams for the project and find the specific team
+        const pTeams = await fetchAPI(`${base}/api/v2/projects/${projectId}/teams?apiKey=${apiKey}`);
+        const team = (pTeams as any[]).find((t: any) => t.id === teamId);
+        if (!team) {
+            return c.json({ error: 'Team not found' }, 404);
+        }
+
+        const members = (team.members || []).map((m: any) => ({
+            id: m.id,
+            name: m.name,
+            roleName: roleMap[m.roleType as number] || '',
+            mailAddress: m.mailAddress || '',
+            nulabAccountName: m.nulabAccount?.name || '',
+            lastLoginTimeJST: fmt(m.lastLoginTime),
+        }));
+
+        return c.json({ teamName: team.name, members });
     } catch (e: any) {
         return c.json({ error: e.message }, 500);
     }
