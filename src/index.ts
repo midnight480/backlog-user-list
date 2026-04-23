@@ -454,6 +454,7 @@ const uiTemplate = `
             darkMode: localStorage.getItem('darkMode') === 'true',
             users: [],
             projects: [],
+            teamAvailable: true,
             rateLimit: null,
             filters: { userEmail: '', projectKey: '' },
             pagination: { 
@@ -682,6 +683,7 @@ const uiTemplate = `
                 
                 state.users = data.users;
                 state.projects = data.projects;
+                state.teamAvailable = data.teamAvailable !== false;
                 if (data.rateLimit) updateRateLimit(data.rateLimit);
 
                 renderUsers();
@@ -770,6 +772,14 @@ const uiTemplate = `
 
             paginated.forEach(p => {
                 const tr = document.createElement('tr');
+                let teamDisplay;
+                if (!state.teamAvailable) {
+                    teamDisplay = '<span style="color:#95a5a6;" title="' + (currentLang === 'ja' ? 'ご利用のプランではチーム機能は利用できません' : 'Team feature is not available on your plan') + '">N/A</span>';
+                } else if (p.teamError) {
+                    teamDisplay = '<span style="color:#e74c3c;" title="' + p.teamError + '">⚠ Error</span>';
+                } else {
+                    teamDisplay = '<span class="clickable proj-teams-link" data-pid="' + p.id + '">' + p.teams.length + '</span>';
+                }
                 tr.innerHTML = \`
                     <td>\${p.projectKey}</td>
                     <td>\${p.name}</td>
@@ -778,7 +788,7 @@ const uiTemplate = `
                         <span class="clickable proj-users-link" data-pid="\${p.id}">\${p.users.length}</span>
                     </td>
                     <td>
-                        <span class="clickable proj-teams-link" data-pid="\${p.id}">\${p.teams.length}</span>
+                        \${teamDisplay}
                     </td>
                 \`;
                 tbody.appendChild(tr);
@@ -1087,11 +1097,31 @@ app.post('/api/analyze', async (c) => {
             joinedProjects: [] as any[]
         });
 
-        // 1. Fetch All Users and Projects
-        const [rawUsers, rawProjects] = await Promise.all([
+        // 1. Fetch Licence, All Users and Projects
+        const [licence, rawUsers, rawProjects] = await Promise.all([
+            fetchAPI(`${base}/api/v2/space/licence?apiKey=${apiKey}`).catch(() => null),
             fetchAPI(`${base}/api/v2/users?apiKey=${apiKey}`) as Promise<any[]>,
             fetchAPI(`${base}/api/v2/projects?apiKey=${apiKey}&all=true`) as Promise<any[]>,
         ]);
+
+        // Determine if team feature is available by probing the first project
+        let teamAvailable = true;
+        const probeTeamsCache = new Map<number, any[]>();
+        if (rawProjects.length > 0) {
+            try {
+                const probeRes = await fetch(`${base}/api/v2/projects/${rawProjects[0].id}/teams?apiKey=${apiKey}`);
+                if (!probeRes.ok) {
+                    teamAvailable = false;
+                } else {
+                    const probeData = await probeRes.json();
+                    if (Array.isArray(probeData)) {
+                        probeTeamsCache.set(rawProjects[0].id, probeData);
+                    }
+                }
+            } catch {
+                teamAvailable = false;
+            }
+        }
 
         const usersMap = new Map<number, any>(rawUsers.map((u: any) => [u.id, enhanceUser(u)]));
         const finalProjects: any[] = [];
@@ -1105,6 +1135,7 @@ app.post('/api/analyze', async (c) => {
             await Promise.all(batch.map(async (proj: any) => {
                 let outUsers: any[] = [];
                 let outTeams: any[] = [];
+                let teamError: string | null = null;
                 
                 try {
                     // Fetch Users in Project
@@ -1122,17 +1153,28 @@ app.post('/api/analyze', async (c) => {
                     console.warn(`Failed to fetch users for project ${proj.id}`, e);
                 }
                     
-                try {
-                    // Fetch Teams in Project (response includes members directly)
-                    const pTeams = await fetchAPI(`${base}/api/v2/projects/${proj.id}/teams?apiKey=${apiKey}`);
-                    outTeams = pTeams.map((pt: any) => ({
-                        id: pt.id,
-                        name: pt.name,
-                        updated: pt.updated,
-                        members: (pt.members || []).map((m: any) => enhanceUser(m))
-                    }));
-                } catch(e) {
-                    console.warn(`Failed to fetch teams for project ${proj.id}`, e);
+                if (teamAvailable) {
+                    try {
+                        // Use cached probe result for the first project, fetch for the rest
+                        let pTeams: any[];
+                        const cached = probeTeamsCache.get(proj.id);
+                        if (cached) {
+                            pTeams = cached;
+                        } else {
+                            pTeams = await fetchAPI(`${base}/api/v2/projects/${proj.id}/teams?apiKey=${apiKey}`);
+                        }
+                        if (Array.isArray(pTeams)) {
+                            outTeams = pTeams.map((pt: any) => ({
+                                id: pt.id,
+                                name: pt.name,
+                                updated: pt.updated,
+                                members: (pt.members || []).map((m: any) => enhanceUser(m))
+                            }));
+                        }
+                    } catch(e: any) {
+                        teamError = e.message || 'Unknown error';
+                        console.warn(`Failed to fetch teams for project ${proj.id}`, e);
+                    }
                 }
 
                 let adminUserIds: number[] = [];
@@ -1150,7 +1192,8 @@ app.post('/api/analyze', async (c) => {
                     archived: proj.archived,
                     users: outUsers,
                     teams: outTeams,
-                    adminUserIds
+                    adminUserIds,
+                    teamError
                 });
             }));
         }
@@ -1163,7 +1206,9 @@ app.post('/api/analyze', async (c) => {
         return c.json({
             users: Array.from(usersMap.values()),
             projects: finalProjects,
-            rateLimit: rateLimitRes ? rateLimitRes.rateLimit : null
+            rateLimit: rateLimitRes ? rateLimitRes.rateLimit : null,
+            teamAvailable,
+            licence: licence || null
         });
 
     } catch (e: any) {
