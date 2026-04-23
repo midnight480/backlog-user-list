@@ -1064,38 +1064,29 @@ app.post('/api/analyze', async (c) => {
             joinedProjects: [] as any[]
         });
 
-        // 1. Fetch All Users, Projects, Teams
-        const [rawUsers, rawProjects, rawTeams] = await Promise.all([
+        // 1. Fetch All Users and Projects
+        const [rawUsers, rawProjects] = await Promise.all([
             fetchAPI(`${base}/api/v2/users?apiKey=${apiKey}`) as Promise<any[]>,
             fetchAPI(`${base}/api/v2/projects?apiKey=${apiKey}&all=true`) as Promise<any[]>,
-            fetchAPI(`${base}/api/v2/teams?apiKey=${apiKey}`) as Promise<any[]>
         ]);
 
         const usersMap = new Map<number, any>(rawUsers.map((u: any) => [u.id, enhanceUser(u)]));
         const finalProjects: any[] = [];
         
-        // 2. Fetch specific team members
-        const teamMembersMap = new Map();
-        for (const t of rawTeams) {
-            try {
-                const td = await fetchAPI(`${base}/api/v2/teams/${t.id}?apiKey=${apiKey}`);
-                const fullMembers = (td.members || []).map((m: any) => enhanceUser(m));
-                teamMembersMap.set(t.id, fullMembers);
-            } catch(e) {
-                teamMembersMap.set(t.id, []);
-            }
-        }
-        
-        // 3. For each project, fetch its users & teams
+        // 2. For each project, fetch its users & teams
+        // GET /api/v2/projects/:id/teams returns members directly, no need for separate team detail calls
         // using concurrency limit to prevent complete rate limiting immediately
         const CONCURRENT = 3;
         for (let i = 0; i < rawProjects.length; i += CONCURRENT) {
             const batch = rawProjects.slice(i, i + CONCURRENT);
             await Promise.all(batch.map(async (proj: any) => {
+                let outUsers: any[] = [];
+                let outTeams: any[] = [];
+                
                 try {
                     // Fetch Users in Project
                     const pUsers = await fetchAPI(`${base}/api/v2/projects/${proj.id}/users?apiKey=${apiKey}`);
-                    const outUsers = pUsers.map((u: any) => {
+                    outUsers = pUsers.map((u: any) => {
                         const existingInfo = usersMap.get(u.id);
                         if (existingInfo) {
                             existingInfo.joinedProjectCount++;
@@ -1104,31 +1095,31 @@ app.post('/api/analyze', async (c) => {
                         }
                         return enhanceUser(u);
                     });
-                    
-                    // Fetch Teams in Project
-                    const pTeams = await fetchAPI(`${base}/api/v2/projects/${proj.id}/teams?apiKey=${apiKey}`);
-                    const outTeams = pTeams.map((pt: any) => {
-                        // find base team to get updated
-                        const baseT = rawTeams.find((rt: any) => rt.id === pt.id) || {};
-                        return {
-                            id: pt.id,
-                            name: pt.name,
-                            updated: baseT.updated,
-                            members: teamMembersMap.get(pt.id) || []
-                        };
-                    });
-                    
-                    finalProjects.push({
-                        id: proj.id,
-                        projectKey: proj.projectKey,
-                        name: proj.name,
-                        archived: proj.archived,
-                        users: outUsers,
-                        teams: outTeams
-                    });
                 } catch(e) {
-                    console.warn(`Failed to fetch nested data for project ${proj.id}`, e);
+                    console.warn(`Failed to fetch users for project ${proj.id}`, e);
                 }
+                    
+                try {
+                    // Fetch Teams in Project (response includes members directly)
+                    const pTeams = await fetchAPI(`${base}/api/v2/projects/${proj.id}/teams?apiKey=${apiKey}`);
+                    outTeams = pTeams.map((pt: any) => ({
+                        id: pt.id,
+                        name: pt.name,
+                        updated: pt.updated,
+                        members: (pt.members || []).map((m: any) => enhanceUser(m))
+                    }));
+                } catch(e) {
+                    console.warn(`Failed to fetch teams for project ${proj.id}`, e);
+                }
+                    
+                finalProjects.push({
+                    id: proj.id,
+                    projectKey: proj.projectKey,
+                    name: proj.name,
+                    archived: proj.archived,
+                    users: outUsers,
+                    teams: outTeams
+                });
             }));
         }
         
