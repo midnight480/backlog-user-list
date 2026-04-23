@@ -455,6 +455,7 @@ const uiTemplate = `
             users: [],
             projects: [],
             teamAvailable: true,
+            credentials: { spaceId: '', domain: '', apiKey: '' },
             rateLimit: null,
             filters: { userEmail: '', projectKey: '' },
             pagination: { 
@@ -681,15 +682,22 @@ const uiTemplate = `
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.error || '予期せぬエラー');
                 
-                state.users = data.users;
-                state.projects = data.projects;
+                state.credentials = { spaceId, domain, apiKey };
                 state.teamAvailable = data.teamAvailable !== false;
+                state.users = data.users.map(u => Object.assign({}, u, { joinedProjectCount: 0, joinedProjects: [] }));
+                state.projects = data.projects.map(p => Object.assign({}, p, {
+                    users: [], teams: [], teamCount: null, adminUserIds: [], _loaded: false, _loading: false, _error: null
+                }));
                 if (data.rateLimit) updateRateLimit(data.rateLimit);
 
                 renderUsers();
                 renderProjects();
-                
                 document.getElementById('results').style.display = 'block';
+
+                // Progressively fetch project details
+                for (let i = 0; i < state.projects.length; i++) {
+                    await fetchProjectDetail(i);
+                }
             } catch (err) {
                 const el = document.getElementById('error-message');
                 el.textContent = err.message;
@@ -699,6 +707,48 @@ const uiTemplate = `
                 document.getElementById('loading').style.display = 'none';
             }
         });
+
+        async function fetchProjectDetail(index) {
+            const proj = state.projects[index];
+            if (proj._loaded || proj._loading) return;
+            proj._loading = true;
+            try {
+                const res = await fetch('/api/project/detail', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        spaceId: state.credentials.spaceId,
+                        domain: state.credentials.domain,
+                        apiKey: state.credentials.apiKey,
+                        projectId: proj.id
+                    })
+                });
+                const detail = await res.json();
+                if (!res.ok) throw new Error(detail.error || 'Failed');
+
+                proj.users = detail.users || [];
+                proj.teams = detail.teams || [];
+                proj.teamCount = detail.teamCount || 0;
+                proj.adminUserIds = detail.adminUserIds || [];
+                proj.teamError = detail.teamError || null;
+                proj._loaded = true;
+                proj._error = null;
+
+                // Update user joinedProjects
+                detail.users.forEach(pu => {
+                    const u = state.users.find(x => x.id === pu.id);
+                    if (u) {
+                        u.joinedProjectCount++;
+                        u.joinedProjects.push({ id: proj.id, name: proj.name, projectKey: proj.projectKey });
+                    }
+                });
+            } catch(e) {
+                proj._error = e.message;
+            }
+            proj._loading = false;
+            renderProjects();
+            renderUsers();
+        }
 
         function renderUsers() {
             const tbody = document.getElementById('users-tbody');
@@ -772,24 +822,36 @@ const uiTemplate = `
 
             paginated.forEach(p => {
                 const tr = document.createElement('tr');
+                const loading = !p._loaded && !p._error;
+                const loadingLabel = currentLang === 'ja' ? '取得中...' : 'Loading...';
+
+                let userDisplay;
+                if (loading) {
+                    userDisplay = '<span style="color:#95a5a6;">' + loadingLabel + '</span>';
+                } else if (p._error) {
+                    userDisplay = '<span style="color:#e74c3c;" title="' + p._error + '">⚠ Error</span>';
+                } else {
+                    userDisplay = '<span class="clickable proj-users-link" data-pid="' + p.id + '">' + p.users.length + '</span>';
+                }
+
                 let teamDisplay;
                 if (!state.teamAvailable) {
                     teamDisplay = '<span style="color:#95a5a6;" title="' + (currentLang === 'ja' ? 'ご利用のプランではチーム機能は利用できません' : 'Team feature is not available on your plan') + '">N/A</span>';
+                } else if (loading) {
+                    teamDisplay = '<span style="color:#95a5a6;">' + loadingLabel + '</span>';
                 } else if (p.teamError) {
                     teamDisplay = '<span style="color:#e74c3c;" title="' + p.teamError + '">⚠ Error</span>';
+                } else if (p._error) {
+                    teamDisplay = '<span style="color:#e74c3c;" title="' + p._error + '">⚠ Error</span>';
                 } else {
-                    teamDisplay = '<span class="clickable proj-teams-link" data-pid="' + p.id + '">' + (p.teamCount !== undefined ? p.teamCount : p.teams.length) + '</span>';
+                    teamDisplay = '<span class="clickable proj-teams-link" data-pid="' + p.id + '">' + p.teamCount + '</span>';
                 }
                 tr.innerHTML = \`
                     <td>\${p.projectKey}</td>
                     <td>\${p.name}</td>
                     <td>\${p.archived ? getT('yesStr') : getT('noStr')}</td>
-                    <td>
-                        <span class="clickable proj-users-link" data-pid="\${p.id}">\${p.users.length}</span>
-                    </td>
-                    <td>
-                        \${teamDisplay}
-                    </td>
+                    <td>\${userDisplay}</td>
+                    <td>\${teamDisplay}</td>
                 \`;
                 tbody.appendChild(tr);
             });
@@ -950,7 +1012,7 @@ const uiTemplate = `
                 
                 if(key === 'projectCount') { vA = (a.joinedProjects||[]).length; vB = (b.joinedProjects||[]).length; }
                 if(key === 'userCount') { vA = (a.users||[]).length; vB = (b.users||[]).length; }
-                if(key === 'teamCount') { vA = a.teamCount !== undefined ? a.teamCount : (a.teams||[]).length; vB = b.teamCount !== undefined ? b.teamCount : (b.teams||[]).length; }
+                if(key === 'teamCount') { vA = a.teamCount != null ? a.teamCount : 0; vB = b.teamCount != null ? b.teamCount : 0; }
                 if(key === 'hasNulab') { vA = (a.nulabAccountName ? 1 : 0); vB = (b.nulabAccountName ? 1 : 0); }
 
                 if (typeof vA === 'string') vA = vA.toLowerCase();
@@ -1066,16 +1128,17 @@ async function fetchAPI(url: string, retries = 3): Promise<any> {
         const res = await fetch(url);
         if (res.status === 429) {
             if (attempt < retries) {
-                // Wait before retry — use Retry-After header or default to 1s with exponential backoff
                 const retryAfter = res.headers.get('Retry-After');
                 const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 1000 * Math.pow(2, attempt);
+                console.log(`Rate limited (429), retrying in ${waitMs}ms (attempt ${attempt + 1}/${retries})`);
                 await new Promise(r => setTimeout(r, waitMs));
                 continue;
             }
-            throw new Error('API Rate Limit Exceeded: Wait and try again.');
+            throw new Error(`Rate Limit Exceeded after ${retries} retries`);
         }
         if (!res.ok) {
-            throw new Error(`API Error ${res.status} at ${url}`);
+            const body = await res.text().catch(() => '');
+            throw new Error(`API Error ${res.status}: ${body}`);
         }
         return res.json() as Promise<any>;
     }
@@ -1090,19 +1153,12 @@ app.post('/api/analyze', async (c) => {
         
         const base = `https://${spaceId}.${domain}`;
         
-        // Fetch Rate Limits
-        let rateLimitRes = null;
-        try {
-            rateLimitRes = await fetchAPI(`${base}/api/v2/rateLimit?apiKey=${apiKey}`);
-        } catch(e) { console.warn("Could not fetch RateLimit", e); }
-
         // Space info for role mapping
         const space = await fetchAPI(`${base}/api/v2/space?apiKey=${apiKey}`);
         const roleMap: Record<number, string> = space.licenseType === 1 
             ? { 1: 'Administrator', 2: 'User', 3: 'Guest' }
             : { 1: 'Administrator', 2: 'User', 3: 'Reporter', 4: 'Guest' };
             
-        // Setup formatter
         const fmt = (dString: string) => {
             if (!dString) return '';
             try { 
@@ -1120,125 +1176,103 @@ app.post('/api/analyze', async (c) => {
             mailAddress: u.mailAddress || '',
             nulabAccountName: u.nulabAccount?.name || '',
             lastLoginTimeJST: fmt(u.lastLoginTime),
-            joinedProjectCount: 0,
-            joinedProjects: [] as any[]
         });
 
-        // 1. Fetch Licence, All Users and Projects
-        const [licence, rawUsers, rawProjects] = await Promise.all([
+        // Fetch licence, users, projects in parallel (5 subrequests)
+        const [licence, rateLimitRes, rawUsers, rawProjects] = await Promise.all([
             fetchAPI(`${base}/api/v2/space/licence?apiKey=${apiKey}`).catch(() => null),
+            fetchAPI(`${base}/api/v2/rateLimit?apiKey=${apiKey}`).catch(() => null),
             fetchAPI(`${base}/api/v2/users?apiKey=${apiKey}`) as Promise<any[]>,
             fetchAPI(`${base}/api/v2/projects?apiKey=${apiKey}&all=true`) as Promise<any[]>,
         ]);
 
-        // Determine if team feature is available by probing the first project
+        // Probe team feature availability on first project (1 subrequest)
         let teamAvailable = true;
-        const probeTeamsCache = new Map<number, any[]>();
         if (rawProjects.length > 0) {
             try {
                 const probeRes = await fetch(`${base}/api/v2/projects/${rawProjects[0].id}/teams?apiKey=${apiKey}`);
-                if (!probeRes.ok) {
-                    teamAvailable = false;
-                } else {
-                    const probeData = await probeRes.json();
-                    if (Array.isArray(probeData)) {
-                        probeTeamsCache.set(rawProjects[0].id, probeData);
-                    }
-                }
+                if (!probeRes.ok) teamAvailable = false;
             } catch {
                 teamAvailable = false;
             }
         }
 
-        const usersMap = new Map<number, any>(rawUsers.map((u: any) => [u.id, enhanceUser(u)]));
-        const finalProjects: any[] = [];
-        
-        // 2. For each project, fetch its users & teams
-        // GET /api/v2/projects/:id/teams returns members directly, no need for separate team detail calls
-        // using concurrency limit to prevent complete rate limiting immediately
-        const CONCURRENT = 2;
-        for (let i = 0; i < rawProjects.length; i += CONCURRENT) {
-            const batch = rawProjects.slice(i, i + CONCURRENT);
-            await Promise.all(batch.map(async (proj: any) => {
-                let outUsers: any[] = [];
-                let outTeams: any[] = [];
-                let teamError: string | null = null;
-                
-                try {
-                    // Fetch Users in Project
-                    const pUsers = await fetchAPI(`${base}/api/v2/projects/${proj.id}/users?apiKey=${apiKey}&excludeGroupMembers=true`);
-                    outUsers = pUsers.map((u: any) => {
-                        const existingInfo = usersMap.get(u.id);
-                        if (existingInfo) {
-                            existingInfo.joinedProjectCount++;
-                            existingInfo.joinedProjects.push({ id: proj.id, name: proj.name, projectKey: proj.projectKey });
-                            return Object.assign({}, existingInfo); // clone representation
-                        }
-                        return enhanceUser(u);
-                    });
-                } catch(e) {
-                    console.warn(`Failed to fetch users for project ${proj.id}`, e);
-                }
-                    
-                if (teamAvailable) {
-                    try {
-                        // Use cached probe result for the first project, fetch for the rest
-                        let pTeams: any[];
-                        const cached = probeTeamsCache.get(proj.id);
-                        if (cached) {
-                            pTeams = cached;
-                        } else {
-                            pTeams = await fetchAPI(`${base}/api/v2/projects/${proj.id}/teams?apiKey=${apiKey}`);
-                        }
-                        if (Array.isArray(pTeams)) {
-                            outTeams = pTeams.map((pt: any) => ({
-                                id: pt.id,
-                                name: pt.name,
-                                updated: pt.updated,
-                                memberCount: (pt.members || []).length
-                            }));
-                        }
-                    } catch(e: any) {
-                        teamError = e.message || 'Unknown error';
-                        console.warn(`Failed to fetch teams for project ${proj.id}`, e);
-                    }
-                }
-
-                let adminUserIds: number[] = [];
-                try {
-                    const pAdmins = await fetchAPI(`${base}/api/v2/projects/${proj.id}/administrators?apiKey=${apiKey}`) as any[];
-                    adminUserIds = pAdmins.map((a: any) => a.id);
-                } catch(e) {
-                    console.warn(`Failed to fetch admins for project ${proj.id}`, e);
-                }
-                    
-                finalProjects.push({
-                    id: proj.id,
-                    projectKey: proj.projectKey,
-                    name: proj.name,
-                    archived: proj.archived,
-                    users: outUsers,
-                    teams: outTeams,
-                    teamCount: outTeams.length,
-                    adminUserIds,
-                    teamError
-                });
-            }));
-        }
-        
-        // Re-Fetch Rate Limits at the very end to be accurate
-        try {
-            rateLimitRes = await fetchAPI(`${base}/api/v2/rateLimit?apiKey=${apiKey}`);
-        } catch(e) { }
+        const users = rawUsers.map((u: any) => enhanceUser(u));
+        const projects = rawProjects.map((p: any) => ({
+            id: p.id,
+            projectKey: p.projectKey,
+            name: p.name,
+            archived: p.archived,
+        }));
 
         return c.json({
-            users: Array.from(usersMap.values()),
-            projects: finalProjects,
+            users,
+            projects,
             rateLimit: rateLimitRes ? rateLimitRes.rateLimit : null,
             teamAvailable,
             licence: licence || null
         });
 
+    } catch (e: any) {
+        return c.json({ error: e.message }, 500);
+    }
+});
+
+// Per-project detail endpoint (users, teams, admins) — keeps subrequests low per call
+app.post('/api/project/detail', async (c) => {
+    try {
+        const { spaceId, domain, apiKey, projectId } = await c.req.json();
+        if (!spaceId || !domain || !apiKey || !projectId) {
+            return c.json({ error: 'Missing parameters' }, 400);
+        }
+
+        const base = `https://${spaceId}.${domain}`;
+
+        const space = await fetchAPI(`${base}/api/v2/space?apiKey=${apiKey}`);
+        const roleMap: Record<number, string> = space.licenseType === 1
+            ? { 1: 'Administrator', 2: 'User', 3: 'Guest' }
+            : { 1: 'Administrator', 2: 'User', 3: 'Reporter', 4: 'Guest' };
+
+        const fmt = (dString: string) => {
+            if (!dString) return '';
+            try {
+                return new Intl.DateTimeFormat('ja-JP', {
+                    timeZone:'Asia/Tokyo', year:'numeric', month:'2-digit', day:'2-digit',
+                    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+                }).format(new Date(dString)).replace(/-/g, '/');
+            } catch { return dString; }
+        };
+
+        const enhanceUser = (u: any) => ({
+            id: u.id,
+            name: u.name,
+            roleName: roleMap[u.roleType as number] || '',
+            mailAddress: u.mailAddress || '',
+            nulabAccountName: u.nulabAccount?.name || '',
+            lastLoginTimeJST: fmt(u.lastLoginTime),
+        });
+
+        // Fetch users, teams, admins in parallel (4 subrequests including space above)
+        let teamError: string | null = null;
+        const [pUsers, pTeams, pAdmins] = await Promise.all([
+            fetchAPI(`${base}/api/v2/projects/${projectId}/users?apiKey=${apiKey}&excludeGroupMembers=true`).catch(() => []),
+            fetchAPI(`${base}/api/v2/projects/${projectId}/teams?apiKey=${apiKey}`).catch((e: any) => {
+                teamError = e.message || 'Unknown error';
+                return [];
+            }),
+            fetchAPI(`${base}/api/v2/projects/${projectId}/administrators?apiKey=${apiKey}`).catch(() => []),
+        ]);
+
+        const users = (Array.isArray(pUsers) ? pUsers : []).map((u: any) => enhanceUser(u));
+        const teams = (Array.isArray(pTeams) ? pTeams : []).map((t: any) => ({
+            id: t.id,
+            name: t.name,
+            updated: t.updated,
+            memberCount: (t.members || []).length,
+        }));
+        const adminUserIds = (Array.isArray(pAdmins) ? pAdmins : []).map((a: any) => a.id);
+
+        return c.json({ users, teams, teamCount: teams.length, adminUserIds, teamError });
     } catch (e: any) {
         return c.json({ error: e.message }, 500);
     }
