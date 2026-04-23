@@ -1108,7 +1108,7 @@ app.post('/api/analyze', async (c) => {
                 
                 try {
                     // Fetch Users in Project
-                    const pUsers = await fetchAPI(`${base}/api/v2/projects/${proj.id}/users?apiKey=${apiKey}`);
+                    const pUsers = await fetchAPI(`${base}/api/v2/projects/${proj.id}/users?apiKey=${apiKey}&excludeGroupMembers=true`);
                     outUsers = pUsers.map((u: any) => {
                         const existingInfo = usersMap.get(u.id);
                         if (existingInfo) {
