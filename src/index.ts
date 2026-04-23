@@ -979,14 +979,37 @@ const uiTemplate = `
 
         // CSV Downloads
         document.getElementById('download-users-btn').addEventListener('click', () => {
-             const rows = [[getT('colName'), getT('colEmail'), getT('colNulab'), getT('colRole'), getT('colLastLogin'), getT('colJoinedProjs')]];
-             state.users.forEach(u => rows.push([u.name, u.mailAddress, u.nulabAccountName ? getT('yes')+' ('+u.nulabAccountName+')' : getT('no'), u.roleName, u.lastLoginTimeJST, u.joinedProjectCount]));
+             const rows = [[getT('colName'), getT('colEmail'), getT('colNulab'), getT('colRole'), getT('colLastLogin'), getT('colProjKey'), getT('colProjName')]];
+             state.users.forEach(u => {
+                 if (u.joinedProjects && u.joinedProjects.length > 0) {
+                     u.joinedProjects.forEach(p => {
+                         rows.push([u.name, u.mailAddress, u.nulabAccountName ? getT('yes')+' ('+u.nulabAccountName+')' : getT('no'), u.roleName, u.lastLoginTimeJST, p.projectKey, p.name]);
+                     });
+                 } else {
+                     rows.push([u.name, u.mailAddress, u.nulabAccountName ? getT('yes')+' ('+u.nulabAccountName+')' : getT('no'), u.roleName, u.lastLoginTimeJST, '', '']);
+                 }
+             });
              downloadCSV('Users', rows);
         });
 
         document.getElementById('download-projects-btn').addEventListener('click', () => {
-             const rows = [[getT('colProjKey'), getT('colProjName'), getT('colArchived'), getT('colUsers'), getT('colTeams')]];
-             state.projects.forEach(p => rows.push([p.projectKey, p.name, p.archived ? getT('yesStr') : getT('noStr'), p.users.length, p.teams.length]));
+             const header = [getT('colProjKey'), getT('colEmail'), getT('colName'), getT('teamName'), currentLang === 'ja' ? 'プロジェクト管理者' : 'Project Admin'];
+             const rows = [header];
+             state.projects.forEach(p => {
+                 const adminIds = new Set(p.adminUserIds || []);
+                 const userRows = (p.users || []).map(u => ({ email: u.mailAddress || '', name: u.name || '', isAdmin: adminIds.has(u.id) }));
+                 const teamNames = (p.teams || []).map(t => t.name || '');
+                 if (userRows.length === 0 && teamNames.length === 0) {
+                     rows.push([p.projectKey, '', '', '', '']);
+                 } else {
+                     const maxLen = Math.max(userRows.length, teamNames.length);
+                     for (let i = 0; i < maxLen; i++) {
+                         const u = userRows[i];
+                         const tn = teamNames[i] || '';
+                         rows.push([p.projectKey, u ? u.email : '', u ? u.name : '', tn, u && u.isAdmin ? '●' : '']);
+                     }
+                 }
+             });
              downloadCSV('Projects', rows);
         });
 
@@ -1111,6 +1134,14 @@ app.post('/api/analyze', async (c) => {
                 } catch(e) {
                     console.warn(`Failed to fetch teams for project ${proj.id}`, e);
                 }
+
+                let adminUserIds: number[] = [];
+                try {
+                    const pAdmins = await fetchAPI(`${base}/api/v2/projects/${proj.id}/administrators?apiKey=${apiKey}`) as any[];
+                    adminUserIds = pAdmins.map((a: any) => a.id);
+                } catch(e) {
+                    console.warn(`Failed to fetch admins for project ${proj.id}`, e);
+                }
                     
                 finalProjects.push({
                     id: proj.id,
@@ -1118,7 +1149,8 @@ app.post('/api/analyze', async (c) => {
                     name: proj.name,
                     archived: proj.archived,
                     users: outUsers,
-                    teams: outTeams
+                    teams: outTeams,
+                    adminUserIds
                 });
             }));
         }
