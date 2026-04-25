@@ -61,4 +61,4 @@ All POST endpoints accept JSON with `spaceId`, `domain`, and `apiKey` fields.
 
 ## License
 
-This project does not currently specify a license.
+This project is licensed under the [MIT License](LICENSE).
